@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import html
 import io
+import os
 import re
 import sys
+import tempfile
+import shutil
 from pathlib import Path
 from typing import Optional, Sequence, List, Tuple, Literal, Dict, Any
 
@@ -113,6 +116,299 @@ def _estimate_text_width(text: str, font_size: float, font_name: str = "") -> fl
     
     total = sum(_CHAR_WIDTHS.get(c, _DEFAULT_CHAR_WIDTH) for c in text)
     return total * font_size
+
+
+# ── Image extraction to temp folder ───────────────────────────────────────────
+
+def _extract_page_images(
+    pdf_doc: fitz.Document,
+    page: fitz.Page,
+    page_num: int,
+    temp_dir: str,
+    dpi: int = 200,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Extract all images from a page to temp folder.
+    Returns list of dicts with image info: {path, x, y, width, height}
+    """
+    extracted_images = []
+    page_rect = page.rect
+    
+    # Method 1: Extract embedded images
+    image_list = page.get_images(full=True)
+    processed_xrefs = set()
+    
+    for img_idx, img_info in enumerate(image_list):
+        xref = img_info[0]
+        if xref in processed_xrefs:
+            continue
+        processed_xrefs.add(xref)
+        
+        try:
+            img_rects = page.get_image_rects(xref)
+            if not img_rects:
+                continue
+            
+            base_image = pdf_doc.extract_image(xref)
+            if not base_image or not base_image.get("image"):
+                continue
+            
+            img_bytes = base_image["image"]
+            img_ext = base_image.get("ext", "png")
+            
+            for rect_idx, img_rect in enumerate(img_rects):
+                if img_rect.width <= 0 or img_rect.height <= 0:
+                    continue
+                
+                # Save to temp file
+                img_filename = f"page{page_num}_img{img_idx}_{rect_idx}.{img_ext}"
+                img_path = os.path.join(temp_dir, img_filename)
+                
+                with open(img_path, "wb") as f:
+                    f.write(img_bytes)
+                
+                extracted_images.append({
+                    "path": img_path,
+                    "x": img_rect.x0,
+                    "y": img_rect.y0,
+                    "width": img_rect.width,
+                    "height": img_rect.height,
+                    "type": "embedded",
+                })
+                
+                if verbose:
+                    print(f"      Extracted embedded image: {img_filename}", file=sys.stderr)
+                    
+        except Exception as e:
+            if verbose:
+                print(f"      Warning: Failed to extract image xref {xref}: {e}", file=sys.stderr)
+            continue
+    
+    # Method 2: Find figure regions (bordered rectangles) and render them
+    figure_regions = _find_figure_regions(page, extracted_images)
+    
+    for fig_idx, fig_rect in enumerate(figure_regions):
+        try:
+            # Render this region
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, clip=fig_rect, alpha=False)
+            
+            # Save to temp file
+            img_filename = f"page{page_num}_fig{fig_idx}.png"
+            img_path = os.path.join(temp_dir, img_filename)
+            pix.save(img_path)
+            
+            extracted_images.append({
+                "path": img_path,
+                "x": fig_rect.x0,
+                "y": fig_rect.y0,
+                "width": fig_rect.width,
+                "height": fig_rect.height,
+                "type": "rendered",
+            })
+            
+            if verbose:
+                print(f"      Rendered figure region: {img_filename} ({fig_rect.width:.0f}x{fig_rect.height:.0f})", file=sys.stderr)
+                
+        except Exception as e:
+            if verbose:
+                print(f"      Warning: Failed to render figure region: {e}", file=sys.stderr)
+            continue
+    
+    return extracted_images
+
+
+def _find_figure_regions(
+    page: fitz.Page,
+    already_extracted: List[Dict],
+) -> List[fitz.Rect]:
+    """
+    Find regions that likely contain figures/images that need to be rendered.
+    """
+    figure_regions = []
+    
+    # Convert already extracted to Rect objects
+    extracted_rects = [
+        fitz.Rect(img["x"], img["y"], img["x"] + img["width"], img["y"] + img["height"])
+        for img in already_extracted
+    ]
+    
+    # Get all drawings to find bordered regions
+    drawings = page.get_drawings()
+    
+    # Find rectangles that might be figure frames
+    candidate_rects = []
+    for drawing in drawings:
+        draw_rect = drawing.get("rect")
+        if draw_rect and draw_rect.width > 80 and draw_rect.height > 80:
+            candidate_rects.append(fitz.Rect(draw_rect))
+        
+        for item in drawing.get("items", []):
+            if item[0] == "re":  # Rectangle
+                r = fitz.Rect(item[1])
+                if r.width > 80 and r.height > 80:
+                    candidate_rects.append(r)
+    
+    # Get text to identify text-sparse regions
+    text_dict = page.get_text("dict")
+    text_blocks = []
+    for block in text_dict.get("blocks", []):
+        if block.get("type") == 0:
+            text_blocks.append(fitz.Rect(block.get("bbox")))
+    
+    # Filter candidates
+    for rect in candidate_rects:
+        # Skip small rectangles
+        if rect.width < 100 or rect.height < 80:
+            continue
+        
+        # Skip if overlaps significantly with already extracted images
+        skip = False
+        for existing in extracted_rects:
+            if rect.intersects(existing):
+                intersection = rect & existing
+                overlap_ratio = (intersection.width * intersection.height) / (rect.width * rect.height)
+                if overlap_ratio > 0.3:
+                    skip = True
+                    break
+        
+        if skip:
+            continue
+        
+        # Count text blocks inside this rectangle
+        text_inside = sum(1 for tb in text_blocks if rect.contains(tb))
+        
+        # If region is mostly empty of text, it's likely a figure
+        if text_inside <= 2:
+            # Add with small margin to capture content
+            inner = fitz.Rect(rect.x0 + 1, rect.y0 + 1, rect.x1 - 1, rect.y1 - 1)
+            if inner.width > 50 and inner.height > 50:
+                figure_regions.append(inner)
+    
+    # Remove duplicates by merging overlapping regions
+    return _merge_rects(figure_regions, margin=5)
+
+
+def _add_image_from_file(
+    doc: Document,
+    paragraph,
+    image_path: str,
+    x_emu: int,
+    y_emu: int,
+    w_emu: int,
+    h_emu: int,
+    shape_id: int,
+    behind_doc: bool = True,
+) -> bool:
+    """Insert a floating image from a file path. Returns True on success."""
+    try:
+        # Read image file
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        
+        # Create a temporary run to add an inline image
+        temp_run = paragraph.add_run()
+        
+        # Add inline image
+        image_stream = io.BytesIO(image_bytes)
+        try:
+            inline_shape = temp_run.add_picture(image_stream, width=Emu(w_emu), height=Emu(h_emu))
+        except Exception:
+            paragraph._element.remove(temp_run._element)
+            return False
+        
+        # Get the blip element to extract rId
+        inline_xml = temp_run._element
+        blip = None
+        rId = None
+        
+        for elem in inline_xml.iter():
+            if 'blip' in elem.tag.lower():
+                blip = elem
+                break
+        
+        if blip is not None:
+            for attr_name, attr_value in blip.attrib.items():
+                if 'embed' in attr_name.lower():
+                    rId = attr_value
+                    break
+        
+        if not rId:
+            paragraph._element.remove(inline_xml)
+            return False
+        
+        # Remove inline image
+        paragraph._element.remove(inline_xml)
+        
+        behind = "1" if behind_doc else "0"
+        
+        xml = (
+            '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+            ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+            ' xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"'
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+            ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            '<mc:AlternateContent>'
+            '<mc:Choice Requires="wps"><w:drawing>'
+            '<wp:anchor distT="0" distB="0" distL="0" distR="0"'
+            ' simplePos="0" relativeHeight="{z}"'
+            ' behindDoc="{behind}" locked="0" layoutInCell="1" allowOverlap="1">'
+            '<wp:simplePos x="0" y="0"/>'
+            '<wp:positionH relativeFrom="page">'
+            '<wp:posOffset>{x}</wp:posOffset>'
+            '</wp:positionH>'
+            '<wp:positionV relativeFrom="page">'
+            '<wp:posOffset>{y}</wp:posOffset>'
+            '</wp:positionV>'
+            '<wp:extent cx="{cx}" cy="{cy}"/>'
+            '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
+            '<wp:wrapNone/>'
+            '<wp:docPr id="{sid}" name="Img{sid}"/>'
+            '<wp:cNvGraphicFramePr>'
+            '<a:graphicFrameLocks noChangeAspect="1"/>'
+            '</wp:cNvGraphicFramePr>'
+            '<a:graphic>'
+            '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            '<pic:pic>'
+            '<pic:nvPicPr>'
+            '<pic:cNvPr id="{sid}" name="Img{sid}"/>'
+            '<pic:cNvPicPr/>'
+            '</pic:nvPicPr>'
+            '<pic:blipFill>'
+            '<a:blip r:embed="{rId}"/>'
+            '<a:stretch><a:fillRect/></a:stretch>'
+            '</pic:blipFill>'
+            '<pic:spPr>'
+            '<a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+            '</pic:spPr>'
+            '</pic:pic>'
+            '</a:graphicData></a:graphic>'
+            '</wp:anchor>'
+            '</w:drawing></mc:Choice>'
+            '<mc:Fallback><w:pict/></mc:Fallback>'
+            '</mc:AlternateContent>'
+            '</w:r>'
+        ).format(
+            x=x_emu,
+            y=y_emu,
+            cx=w_emu,
+            cy=h_emu,
+            sid=shape_id,
+            z=251650000 + shape_id,
+            rId=rId,
+            behind=behind,
+        )
+        
+        run_element = parse_xml(xml)
+        paragraph._element.append(run_element)
+        return True
+        
+    except Exception:
+        return False
 
 
 # ── Floating image insertion ──────────────────────────────────────────────────
@@ -517,7 +813,9 @@ def _process_page_editable(
     pdf_doc: fitz.Document,
     word_doc: Document,
     page: fitz.Page,
+    page_num: int,
     is_first: bool,
+    temp_dir: str,
     dpi: int = 200,
     verbose: bool = False,
 ) -> None:
@@ -555,80 +853,36 @@ def _process_page_editable(
     anchor_para.paragraph_format.space_before = Pt(0)
     anchor_para.paragraph_format.space_after = Pt(0)
 
-    # ── Step 1: Extract and place images ──────────────────────────────────
-    image_rects = []  # Track image positions
+    # ── Step 1: Extract images to temp folder, then insert ────────────────
+    if verbose:
+        print(f"    Extracting images...", file=sys.stderr)
     
-    # Method 1: Direct image extraction
-    image_list = page.get_images(full=True)
-    processed_xrefs = set()
+    extracted_images = _extract_page_images(
+        pdf_doc, page, page_num, temp_dir, dpi=dpi, verbose=verbose
+    )
     
-    for img_info in image_list:
-        xref = img_info[0]
-        if xref in processed_xrefs:
-            continue
-        processed_xrefs.add(xref)
-        
-        try:
-            img_rects_list = page.get_image_rects(xref)
-            if not img_rects_list:
-                continue
-            
-            base_image = pdf_doc.extract_image(xref)
-            if not base_image or not base_image.get("image"):
-                continue
-            
-            img_bytes = base_image["image"]
-            
-            for img_rect in img_rects_list:
-                if img_rect.width <= 0 or img_rect.height <= 0:
-                    continue
-                
-                image_rects.append(fitz.Rect(img_rect))
-                
-                _add_floating_image(
-                    word_doc,
-                    anchor_para,
-                    img_bytes,
-                    _pt2emu(img_rect.x0),
-                    _pt2emu(img_rect.y0),
-                    _pt2emu(img_rect.width),
-                    _pt2emu(img_rect.height),
-                    _next_shape_id(),
-                    behind_doc=True,
-                )
-        except Exception as e:
+    image_rects = []
+    for img_info in extracted_images:
+        success = _add_image_from_file(
+            word_doc,
+            anchor_para,
+            img_info["path"],
+            _pt2emu(img_info["x"]),
+            _pt2emu(img_info["y"]),
+            _pt2emu(img_info["width"]),
+            _pt2emu(img_info["height"]),
+            _next_shape_id(),
+            behind_doc=True,
+        )
+        if success:
+            image_rects.append(fitz.Rect(
+                img_info["x"], 
+                img_info["y"], 
+                img_info["x"] + img_info["width"],
+                img_info["y"] + img_info["height"]
+            ))
             if verbose:
-                print(f"    Warning: Failed to extract image: {e}", file=sys.stderr)
-            continue
-    
-    # Method 2: Detect figure regions by looking for large empty rectangles with borders
-    # These often contain images that weren't directly extractable
-    figure_regions = _detect_figure_regions(page, image_rects)
-    
-    for fig_rect in figure_regions:
-        try:
-            # Render this region as an image
-            zoom = min(dpi, 250) / 72.0
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, clip=fig_rect, alpha=False)
-            img_bytes = pix.tobytes("png")
-            
-            _add_floating_image(
-                word_doc,
-                anchor_para,
-                img_bytes,
-                _pt2emu(fig_rect.x0),
-                _pt2emu(fig_rect.y0),
-                _pt2emu(fig_rect.width),
-                _pt2emu(fig_rect.height),
-                _next_shape_id(),
-                behind_doc=True,
-            )
-            image_rects.append(fig_rect)
-        except Exception as e:
-            if verbose:
-                print(f"    Warning: Failed to render figure region: {e}", file=sys.stderr)
-            continue
+                print(f"      Inserted: {os.path.basename(img_info['path'])}", file=sys.stderr)
 
     # ── Step 2: Extract and place drawings/shapes ─────────────────────────
     drawings = page.get_drawings()
@@ -844,110 +1098,6 @@ def _process_page_exact(
     )
 
 
-# ── Helper: Detect figure regions ─────────────────────────────────────────────
-
-def _detect_figure_regions(
-    page: fitz.Page,
-    already_extracted: List[fitz.Rect],
-) -> List[fitz.Rect]:
-    """
-    Detect regions that likely contain figures/images that weren't directly extracted.
-    
-    This looks for:
-    1. Large rectangular regions bounded by lines
-    2. Areas with drawings but little/no text
-    3. XObject forms that might contain graphics
-    """
-    figure_regions = []
-    page_rect = page.rect
-    
-    # Get all drawings to find bordered regions
-    drawings = page.get_drawings()
-    
-    # Collect all rectangles from drawings
-    draw_rects = []
-    for drawing in drawings:
-        for item in drawing.get("items", []):
-            if item[0] == "re":  # Rectangle
-                r = fitz.Rect(item[1])
-                # Only consider reasonably sized rectangles (likely figure frames)
-                if r.width > 50 and r.height > 50:
-                    draw_rects.append(r)
-    
-    # Get text blocks to identify text-sparse regions
-    text_dict = page.get_text("dict")
-    text_rects = []
-    for block in text_dict.get("blocks", []):
-        if block.get("type") == 0:  # Text block
-            text_rects.append(fitz.Rect(block.get("bbox")))
-    
-    # Check each drawing rectangle to see if it might be a figure frame
-    for rect in draw_rects:
-        # Skip if too small
-        if rect.width < 100 or rect.height < 100:
-            continue
-        
-        # Skip if this overlaps with already extracted images
-        overlaps_existing = False
-        for existing in already_extracted:
-            if rect.intersects(existing):
-                intersection = rect & existing
-                overlap_area = intersection.width * intersection.height
-                rect_area = rect.width * rect.height
-                if overlap_area > rect_area * 0.5:  # More than 50% overlap
-                    overlaps_existing = True
-                    break
-        
-        if overlaps_existing:
-            continue
-        
-        # Check if this region has little text (suggesting it's a figure)
-        text_in_region = 0
-        for text_rect in text_rects:
-            if rect.contains(text_rect):
-                text_in_region += 1
-        
-        # If region has few text blocks, it's likely a figure
-        # Allow some text (for captions inside the figure)
-        if text_in_region <= 3:
-            # Shrink slightly to avoid capturing the border itself
-            inner_rect = fitz.Rect(
-                rect.x0 + 2,
-                rect.y0 + 2,
-                rect.x1 - 2,
-                rect.y1 - 2
-            )
-            if inner_rect.width > 50 and inner_rect.height > 50:
-                figure_regions.append(inner_rect)
-    
-    # Also check for Form XObjects which often contain vector graphics
-    try:
-        xobjects = page.get_xobjects()
-        for xobj in xobjects:
-            try:
-                xref = xobj[0]
-                # Try to get the position of this XObject
-                # This is tricky as XObjects don't always have direct position info
-                xobj_rects = page.get_image_rects(xref)
-                for xobj_rect in (xobj_rects or []):
-                    if xobj_rect.width > 50 and xobj_rect.height > 50:
-                        # Check if not already covered
-                        is_covered = False
-                        for existing in already_extracted + figure_regions:
-                            if existing.contains(xobj_rect) or xobj_rect.contains(existing):
-                                is_covered = True
-                                break
-                        if not is_covered:
-                            figure_regions.append(fitz.Rect(xobj_rect))
-            except Exception:
-                continue
-    except Exception:
-        pass
-    
-    # Merge overlapping figure regions
-    return _merge_rects(figure_regions, margin=10)
-
-
 # ── Helper: Merge overlapping rectangles ──────────────────────────────────────
 
 def _merge_rects(rects: List[fitz.Rect], margin: float = 5) -> List[fitz.Rect]:
@@ -1049,17 +1199,41 @@ def convert_pdf_to_docx(
     if verbose:
         print(f"Converting {pdf_path.name} ({total} pages, {mode} mode)...", file=sys.stderr)
 
-    for i, idx in enumerate(page_indices):
-        page = pdf_doc[idx]
+    # Create temp directory for image extraction
+    temp_dir = tempfile.mkdtemp(prefix="pdf2docx_")
+    
+    try:
         if verbose:
-            print(f"  [{i + 1}/{total}] Processing page {idx + 1}...", file=sys.stderr)
+            print(f"  Temp folder: {temp_dir}", file=sys.stderr)
         
-        if mode == "exact":
-            _process_page_exact(pdf_doc, word_doc, page, is_first=(i == 0), dpi=dpi)
-        else:
-            _process_page_editable(pdf_doc, word_doc, page, is_first=(i == 0), dpi=dpi, verbose=verbose)
+        for i, idx in enumerate(page_indices):
+            page = pdf_doc[idx]
+            if verbose:
+                print(f"  [{i + 1}/{total}] Processing page {idx + 1}...", file=sys.stderr)
+            
+            if mode == "exact":
+                _process_page_exact(pdf_doc, word_doc, page, is_first=(i == 0), dpi=dpi)
+            else:
+                _process_page_editable(
+                    pdf_doc, word_doc, page, 
+                    page_num=idx + 1,
+                    is_first=(i == 0), 
+                    temp_dir=temp_dir,
+                    dpi=dpi, 
+                    verbose=verbose
+                )
 
-    word_doc.save(str(docx_path))
+        word_doc.save(str(docx_path))
+        
+    finally:
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_dir)
+            if verbose:
+                print(f"  Cleaned up temp folder", file=sys.stderr)
+        except Exception:
+            pass
+    
     pdf_doc.close()
 
     if verbose:
