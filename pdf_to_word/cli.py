@@ -12,8 +12,8 @@ from pdf_to_word.converter import convert_pdf_to_docx
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="pdf-to-word",
-        description="Convert a PDF to an editable Word (.docx) document "
-        "preserving text, images, tables, links, and layout.",
+        description="Convert a PDF to a Word (.docx) document "
+        "preserving layout, images, and text.",
     )
     parser.add_argument("pdf", help="Path to the input PDF file.")
     parser.add_argument(
@@ -33,8 +33,17 @@ def main(argv: list[str] | None = None) -> None:
         "--dpi",
         type=int,
         default=300,
-        help="DPI for rasterised/clipped images (default: 300). "
-        "Higher = sharper images but larger file.",
+        help="DPI for rendering (default: 300). "
+        "Higher = sharper output but larger file.",
+    )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=["exact", "editable"],
+        default="exact",
+        help="Conversion mode: 'exact' renders pages as images for perfect "
+        "visual fidelity (default), 'editable' extracts text as editable "
+        "boxes (may have layout issues with complex PDFs).",
     )
     parser.add_argument(
         "-v",
@@ -63,6 +72,7 @@ def main(argv: list[str] | None = None) -> None:
         args.output,
         pages=pages,
         dpi=args.dpi,
+        mode=args.mode,
         verbose=args.verbose,
     )
 
