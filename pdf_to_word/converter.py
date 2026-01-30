@@ -63,67 +63,69 @@ def _add_floating_image(
     behind_doc: bool = True,
 ) -> None:
     """Insert a floating image at an exact page position."""
+    from docx.parts.image import Image as DocxImage
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    
     # Add image to the document's media and get the relationship ID
-    # Handle different python-docx versions
     image_stream = io.BytesIO(image_bytes)
     
-    try:
-        # Try newer API first
-        image_part, rId = doc.part.get_or_add_image(image_stream)
-    except AttributeError:
-        # Fall back to older API
-        image_part, rId = doc.part.get_or_add_image_part(image_stream)
+    # Get the document part and add the image
+    document_part = doc.part
+    
+    # Create an image part and relate it to the document
+    image_part = DocxImage.from_blob(image_bytes)
+    rId = document_part.relate_to(image_part, RT.IMAGE)
     
     behind = "1" if behind_doc else "0"
 
     xml = (
         '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
-        '     xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
-        '     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
-        '     xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"'
-        '     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
-        '     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
-        "<mc:AlternateContent>"
+        ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+        ' xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+        '<mc:AlternateContent>'
         '<mc:Choice Requires="wps"><w:drawing>'
         '<wp:anchor distT="0" distB="0" distL="0" distR="0"'
         ' simplePos="0" relativeHeight="{z}"'
         ' behindDoc="{behind}" locked="0" layoutInCell="1" allowOverlap="1">'
         '<wp:simplePos x="0" y="0"/>'
         '<wp:positionH relativeFrom="page">'
-        "  <wp:posOffset>{x}</wp:posOffset>"
-        "</wp:positionH>"
+        '<wp:posOffset>{x}</wp:posOffset>'
+        '</wp:positionH>'
         '<wp:positionV relativeFrom="page">'
-        "  <wp:posOffset>{y}</wp:posOffset>"
-        "</wp:positionV>"
+        '<wp:posOffset>{y}</wp:posOffset>'
+        '</wp:positionV>'
         '<wp:extent cx="{cx}" cy="{cy}"/>'
         '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
-        "<wp:wrapNone/>"
+        '<wp:wrapNone/>'
         '<wp:docPr id="{sid}" name="Img{sid}"/>'
-        "<wp:cNvGraphicFramePr>"
-        '  <a:graphicFrameLocks noChangeAspect="1"/>'
-        "</wp:cNvGraphicFramePr>"
-        "<a:graphic>"
+        '<wp:cNvGraphicFramePr>'
+        '<a:graphicFrameLocks noChangeAspect="1"/>'
+        '</wp:cNvGraphicFramePr>'
+        '<a:graphic>'
         '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
-        "<pic:pic>"
-        "<pic:nvPicPr>"
-        '  <pic:cNvPr id="{sid}" name="Img{sid}"/>'
-        "  <pic:cNvPicPr/>"
-        "</pic:nvPicPr>"
-        "<pic:blipFill>"
-        '  <a:blip r:embed="{rId}"/>'
-        "  <a:stretch><a:fillRect/></a:stretch>"
-        "</pic:blipFill>"
-        "<pic:spPr>"
-        '  <a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
-        '  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
-        "</pic:spPr>"
-        "</pic:pic>"
-        "</a:graphicData></a:graphic>"
-        "</wp:anchor>"
-        "</w:drawing></mc:Choice>"
-        "<mc:Fallback><w:pict/></mc:Fallback>"
-        "</mc:AlternateContent>"
-        "</w:r>"
+        '<pic:pic>'
+        '<pic:nvPicPr>'
+        '<pic:cNvPr id="{sid}" name="Img{sid}"/>'
+        '<pic:cNvPicPr/>'
+        '</pic:nvPicPr>'
+        '<pic:blipFill>'
+        '<a:blip r:embed="{rId}"/>'
+        '<a:stretch><a:fillRect/></a:stretch>'
+        '</pic:blipFill>'
+        '<pic:spPr>'
+        '<a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '</pic:spPr>'
+        '</pic:pic>'
+        '</a:graphicData></a:graphic>'
+        '</wp:anchor>'
+        '</w:drawing></mc:Choice>'
+        '<mc:Fallback><w:pict/></mc:Fallback>'
+        '</mc:AlternateContent>'
+        '</w:r>'
     ).format(
         x=x_emu,
         y=y_emu,
