@@ -1,14 +1,12 @@
 # PDFtoRTF-DOCX
 
-Convert PDF files to Word (.docx) documents with pixel-perfect layout.
+Convert PDF files to **editable** Word (.docx) documents while preserving:
 
-## Conversion modes
-
-| Mode | Layout fidelity | Editable text? | Best for |
-|------|----------------|----------------|----------|
-| `image` (default) | Pixel-perfect | No | Any PDF — guaranteed exact match |
-| `text` | Approximate | Yes | Simple, text-heavy PDFs |
-| `hybrid` | Mixed | Partially | When you want editable text where possible |
+- **Text** — fonts, sizes, colours, bold/italic/underline (fully editable)
+- **Images & figures** — embedded at high resolution (movable/resizable)
+- **Tables** — with merged cells, borders, shading (editable cells)
+- **Hyperlinks** — clickable links carried over
+- **Page layout** — margins, columns, spacing matched to the PDF
 
 ## Quick start
 
@@ -16,21 +14,20 @@ Convert PDF files to Word (.docx) documents with pixel-perfect layout.
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Convert (default = pixel-perfect image mode)
+# 2. Convert a PDF → editable DOCX
 python convert.py "input.pdf"
 
-# 3. Editable text mode (may have layout differences)
-python convert.py "input.pdf" -m text
+# 3. Custom output path
+python convert.py "input.pdf" -o "output.docx"
 
-# 4. Hybrid mode (auto-falls back to image for bad pages)
-python convert.py "input.pdf" -m hybrid
+# 4. Verbose progress
+python convert.py "input.pdf" -v
 ```
 
 ## CLI options
 
 ```
-usage: pdf-to-word [-h] [-o OUTPUT] [-m {image,text,hybrid}] [-p PAGES]
-                   [--dpi DPI] [-v] pdf
+usage: pdf-to-word [-h] [-o OUTPUT] [-p PAGES] [--dpi DPI] [-v] pdf
 
 positional arguments:
   pdf                   Path to the input PDF file.
@@ -38,10 +35,8 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -o, --output OUTPUT   Output DOCX path. Defaults to <input>.docx.
-  -m, --mode {image,text,hybrid}
-                        Conversion mode (default: image).
   -p, --pages PAGES     Comma-separated 0-based page numbers (e.g. 0,1,3).
-  --dpi DPI             DPI for image rendering (default: 300).
+  --dpi DPI             DPI for images (default: 300). Higher = sharper.
   -v, --verbose         Print progress information.
 ```
 
@@ -50,15 +45,15 @@ options:
 ```python
 from pdf_to_word import convert_pdf_to_docx
 
-# Pixel-perfect (default)
-convert_pdf_to_docx("report.pdf")
-
-# Editable text
-convert_pdf_to_docx("report.pdf", mode="text")
-
-# Custom DPI for higher quality
-convert_pdf_to_docx("report.pdf", dpi=400, verbose=True)
+convert_pdf_to_docx("report.pdf", verbose=True)
 ```
+
+## How it works
+
+1. **pdf2docx** extracts editable text, tables, images, and links with tuned
+   parameters that reduce overlapping and line-shift artefacts.
+2. **Post-processing** corrects page dimensions, orientation, and paragraph
+   spacing so the DOCX layout matches the PDF as closely as possible.
 
 ## Requirements
 
