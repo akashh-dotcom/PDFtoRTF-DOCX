@@ -558,6 +558,7 @@ def _process_page_editable(
     # ── Step 1: Extract and place images ──────────────────────────────────
     image_rects = []  # Track image positions
     
+    # Method 1: Direct image extraction
     image_list = page.get_images(full=True)
     processed_xrefs = set()
     
@@ -568,8 +569,8 @@ def _process_page_editable(
         processed_xrefs.add(xref)
         
         try:
-            img_rects = page.get_image_rects(xref)
-            if not img_rects:
+            img_rects_list = page.get_image_rects(xref)
+            if not img_rects_list:
                 continue
             
             base_image = pdf_doc.extract_image(xref)
@@ -578,7 +579,7 @@ def _process_page_editable(
             
             img_bytes = base_image["image"]
             
-            for img_rect in img_rects:
+            for img_rect in img_rects_list:
                 if img_rect.width <= 0 or img_rect.height <= 0:
                     continue
                 
@@ -598,6 +599,35 @@ def _process_page_editable(
         except Exception as e:
             if verbose:
                 print(f"    Warning: Failed to extract image: {e}", file=sys.stderr)
+            continue
+    
+    # Method 2: Detect figure regions by looking for large empty rectangles with borders
+    # These often contain images that weren't directly extractable
+    figure_regions = _detect_figure_regions(page, image_rects)
+    
+    for fig_rect in figure_regions:
+        try:
+            # Render this region as an image
+            zoom = min(dpi, 250) / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, clip=fig_rect, alpha=False)
+            img_bytes = pix.tobytes("png")
+            
+            _add_floating_image(
+                word_doc,
+                anchor_para,
+                img_bytes,
+                _pt2emu(fig_rect.x0),
+                _pt2emu(fig_rect.y0),
+                _pt2emu(fig_rect.width),
+                _pt2emu(fig_rect.height),
+                _next_shape_id(),
+                behind_doc=True,
+            )
+            image_rects.append(fig_rect)
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: Failed to render figure region: {e}", file=sys.stderr)
             continue
 
     # ── Step 2: Extract and place drawings/shapes ─────────────────────────
@@ -812,6 +842,110 @@ def _process_page_exact(
         shape_id=_next_shape_id(),
         behind_doc=True,
     )
+
+
+# ── Helper: Detect figure regions ─────────────────────────────────────────────
+
+def _detect_figure_regions(
+    page: fitz.Page,
+    already_extracted: List[fitz.Rect],
+) -> List[fitz.Rect]:
+    """
+    Detect regions that likely contain figures/images that weren't directly extracted.
+    
+    This looks for:
+    1. Large rectangular regions bounded by lines
+    2. Areas with drawings but little/no text
+    3. XObject forms that might contain graphics
+    """
+    figure_regions = []
+    page_rect = page.rect
+    
+    # Get all drawings to find bordered regions
+    drawings = page.get_drawings()
+    
+    # Collect all rectangles from drawings
+    draw_rects = []
+    for drawing in drawings:
+        for item in drawing.get("items", []):
+            if item[0] == "re":  # Rectangle
+                r = fitz.Rect(item[1])
+                # Only consider reasonably sized rectangles (likely figure frames)
+                if r.width > 50 and r.height > 50:
+                    draw_rects.append(r)
+    
+    # Get text blocks to identify text-sparse regions
+    text_dict = page.get_text("dict")
+    text_rects = []
+    for block in text_dict.get("blocks", []):
+        if block.get("type") == 0:  # Text block
+            text_rects.append(fitz.Rect(block.get("bbox")))
+    
+    # Check each drawing rectangle to see if it might be a figure frame
+    for rect in draw_rects:
+        # Skip if too small
+        if rect.width < 100 or rect.height < 100:
+            continue
+        
+        # Skip if this overlaps with already extracted images
+        overlaps_existing = False
+        for existing in already_extracted:
+            if rect.intersects(existing):
+                intersection = rect & existing
+                overlap_area = intersection.width * intersection.height
+                rect_area = rect.width * rect.height
+                if overlap_area > rect_area * 0.5:  # More than 50% overlap
+                    overlaps_existing = True
+                    break
+        
+        if overlaps_existing:
+            continue
+        
+        # Check if this region has little text (suggesting it's a figure)
+        text_in_region = 0
+        for text_rect in text_rects:
+            if rect.contains(text_rect):
+                text_in_region += 1
+        
+        # If region has few text blocks, it's likely a figure
+        # Allow some text (for captions inside the figure)
+        if text_in_region <= 3:
+            # Shrink slightly to avoid capturing the border itself
+            inner_rect = fitz.Rect(
+                rect.x0 + 2,
+                rect.y0 + 2,
+                rect.x1 - 2,
+                rect.y1 - 2
+            )
+            if inner_rect.width > 50 and inner_rect.height > 50:
+                figure_regions.append(inner_rect)
+    
+    # Also check for Form XObjects which often contain vector graphics
+    try:
+        xobjects = page.get_xobjects()
+        for xobj in xobjects:
+            try:
+                xref = xobj[0]
+                # Try to get the position of this XObject
+                # This is tricky as XObjects don't always have direct position info
+                xobj_rects = page.get_image_rects(xref)
+                for xobj_rect in (xobj_rects or []):
+                    if xobj_rect.width > 50 and xobj_rect.height > 50:
+                        # Check if not already covered
+                        is_covered = False
+                        for existing in already_extracted + figure_regions:
+                            if existing.contains(xobj_rect) or xobj_rect.contains(existing):
+                                is_covered = True
+                                break
+                        if not is_covered:
+                            figure_regions.append(fitz.Rect(xobj_rect))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    
+    # Merge overlapping figure regions
+    return _merge_rects(figure_regions, margin=10)
 
 
 # ── Helper: Merge overlapping rectangles ──────────────────────────────────────
