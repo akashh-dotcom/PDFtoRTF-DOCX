@@ -12,8 +12,8 @@ from pdf_to_word.converter import convert_pdf_to_docx
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="pdf-to-word",
-        description="Convert a PDF to a Word (.docx) document preserving "
-        "images, tables, links, and layout.",
+        description="Convert a PDF to an editable Word (.docx) document "
+        "preserving text, images, tables, links, and layout.",
     )
     parser.add_argument("pdf", help="Path to the input PDF file.")
     parser.add_argument(
@@ -33,7 +33,8 @@ def main(argv: list[str] | None = None) -> None:
         "--dpi",
         type=int,
         default=300,
-        help="DPI for image-based fallback rendering (default: 300).",
+        help="DPI for rasterised/clipped images (default: 300). "
+        "Higher = sharper images but larger file.",
     )
     parser.add_argument(
         "-v",
