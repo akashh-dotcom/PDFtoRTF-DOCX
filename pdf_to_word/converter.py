@@ -63,18 +63,40 @@ def _add_floating_image(
     behind_doc: bool = True,
 ) -> None:
     """Insert a floating image at an exact page position."""
-    from docx.parts.image import Image as DocxImage
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.shared import Inches
+    from docx.oxml.ns import nsmap
+    from lxml import etree
     
-    # Add image to the document's media and get the relationship ID
+    # Create a temporary run to add an inline image, then extract the rId
+    temp_run = paragraph.add_run()
+    
+    # Add inline image to get the relationship set up
     image_stream = io.BytesIO(image_bytes)
+    inline_shape = temp_run.add_picture(image_stream, width=Emu(w_emu), height=Emu(h_emu))
     
-    # Get the document part and add the image
-    document_part = doc.part
+    # Get the blip element to extract rId
+    inline_xml = temp_run._element
+    blip = inline_xml.find('.//' + '{http://schemas.openxmlformats.org/drawingml/2006/main}blip', 
+                           namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
     
-    # Create an image part and relate it to the document
-    image_part = DocxImage.from_blob(image_bytes)
-    rId = document_part.relate_to(image_part, RT.IMAGE)
+    if blip is None:
+        # Fallback: search without namespace prefix
+        for elem in inline_xml.iter():
+            if 'blip' in elem.tag:
+                blip = elem
+                break
+    
+    if blip is None:
+        return  # Can't find blip, skip this image
+    
+    # Extract the relationship ID
+    rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+    
+    if not rId:
+        return  # No rId found, skip
+    
+    # Now remove the inline image run and create a floating one
+    paragraph._element.remove(inline_xml)
     
     behind = "1" if behind_doc else "0"
 
