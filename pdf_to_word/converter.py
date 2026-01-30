@@ -1,28 +1,29 @@
 """
-PDF → DOCX converter with exact visual fidelity.
+PDF → DOCX converter with exact visual fidelity and editability options.
 
-This module uses a hybrid approach to guarantee the DOCX looks exactly like the PDF:
+This module provides two conversion modes:
+1. "exact" - Renders pages as images for perfect visual match (searchable but not editable)
+2. "editable" - Extracts all elements as editable content with improved layout handling
 
-1. Renders each PDF page as a high-resolution background image
-2. Overlays invisible (transparent) but selectable text for searchability
-3. The result is visually identical to the PDF while still being searchable
-
-For fully editable output, use mode="editable" which places text as floating boxes.
+The editable mode uses advanced techniques to minimize layout issues while maintaining editability.
 """
 
 from __future__ import annotations
 
 import html
 import io
+import re
 import sys
 from pathlib import Path
-from typing import Optional, Sequence, List, Tuple, Literal
+from typing import Optional, Sequence, List, Tuple, Literal, Dict, Any
 
 import fitz  # PyMuPDF
 from docx import Document
 from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import parse_xml
-from docx.shared import Emu, Pt
+from docx.oxml.ns import nsmap, qn
+from docx.shared import Emu, Pt, Inches, RGBColor, Twips
 
 
 # ── Unit helpers ─────────────────────────────────────────────────────────────
@@ -32,6 +33,9 @@ _IN_TO_EMU = 914400         # 1 in  = 914 400 EMU
 
 def _pt2emu(pt: float) -> int:
     return int(pt * _PT_TO_EMU)
+
+def _emu2pt(emu: int) -> float:
+    return emu / _PT_TO_EMU
 
 
 # ── Shape ID counter ─────────────────────────────────────────────────────────
@@ -49,7 +53,69 @@ def _escape(text: str) -> str:
     return html.escape(text, quote=True)
 
 
-# ── Floating image builder ───────────────────────────────────────────────────
+# ── Color conversion ──────────────────────────────────────────────────────────
+
+def _color_to_hex(color) -> str:
+    """Convert a PyMuPDF colour (int, tuple, list, or None) to 6-char hex."""
+    if color is None:
+        return "000000"
+    if isinstance(color, (tuple, list)):
+        if len(color) >= 3:
+            r, g, b = int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
+            return f"{r:02X}{g:02X}{b:02X}"
+        if len(color) == 1:
+            v = int(color[0] * 255)
+            return f"{v:02X}{v:02X}{v:02X}"
+        return "000000"
+    if isinstance(color, float):
+        v = int(color * 255)
+        return f"{v:02X}{v:02X}{v:02X}"
+    # int (sRGB packed)
+    r = (color >> 16) & 0xFF
+    g = (color >> 8) & 0xFF
+    b = color & 0xFF
+    return f"{r:02X}{g:02X}{b:02X}"
+
+
+def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color to RGB tuple."""
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+# ── Text width estimation ─────────────────────────────────────────────────────
+
+# Character width factors for proportional fonts (relative to font size)
+_CHAR_WIDTHS = {
+    'i': 0.28, 'l': 0.28, 'I': 0.28, '1': 0.50, '.': 0.28, ',': 0.28,
+    ':': 0.28, ';': 0.28, '!': 0.33, "'": 0.19, '"': 0.41, '|': 0.28,
+    'j': 0.28, 'f': 0.33, 't': 0.33, 'r': 0.39, ' ': 0.28,
+    'm': 0.89, 'w': 0.78, 'M': 0.89, 'W': 1.00, '@': 0.92, '%': 0.89,
+    'A': 0.67, 'B': 0.67, 'C': 0.72, 'D': 0.72, 'E': 0.67, 'F': 0.61,
+    'G': 0.78, 'H': 0.72, 'J': 0.50, 'K': 0.67, 'L': 0.56, 'N': 0.72,
+    'O': 0.78, 'P': 0.67, 'Q': 0.78, 'R': 0.72, 'S': 0.67, 'T': 0.61,
+    'U': 0.72, 'V': 0.67, 'X': 0.67, 'Y': 0.67, 'Z': 0.61,
+}
+_DEFAULT_CHAR_WIDTH = 0.56
+
+
+def _estimate_text_width(text: str, font_size: float, font_name: str = "") -> float:
+    """Estimate text width in points."""
+    if not text:
+        return 0
+    
+    # Check for monospace
+    mono_keywords = ['mono', 'courier', 'consolas', 'menlo', 'fixed', 'code']
+    is_mono = any(kw in font_name.lower() for kw in mono_keywords)
+    
+    if is_mono:
+        return len(text) * font_size * 0.6
+    
+    total = sum(_CHAR_WIDTHS.get(c, _DEFAULT_CHAR_WIDTH) for c in text)
+    return total * font_size
+
+
+# ── Floating image insertion ──────────────────────────────────────────────────
 
 def _add_floating_image(
     doc: Document,
@@ -63,39 +129,44 @@ def _add_floating_image(
     behind_doc: bool = True,
 ) -> None:
     """Insert a floating image at an exact page position."""
-    from docx.shared import Inches
-    from docx.oxml.ns import nsmap
-    from lxml import etree
-    
     # Create a temporary run to add an inline image, then extract the rId
     temp_run = paragraph.add_run()
     
     # Add inline image to get the relationship set up
     image_stream = io.BytesIO(image_bytes)
-    inline_shape = temp_run.add_picture(image_stream, width=Emu(w_emu), height=Emu(h_emu))
+    try:
+        inline_shape = temp_run.add_picture(image_stream, width=Emu(w_emu), height=Emu(h_emu))
+    except Exception:
+        # If image fails to load, skip it
+        paragraph._element.remove(temp_run._element)
+        return
     
     # Get the blip element to extract rId
     inline_xml = temp_run._element
-    blip = inline_xml.find('.//' + '{http://schemas.openxmlformats.org/drawingml/2006/main}blip', 
-                           namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
+    blip = None
+    
+    # Search for blip element
+    for elem in inline_xml.iter():
+        if 'blip' in elem.tag.lower():
+            blip = elem
+            break
     
     if blip is None:
-        # Fallback: search without namespace prefix
-        for elem in inline_xml.iter():
-            if 'blip' in elem.tag:
-                blip = elem
-                break
-    
-    if blip is None:
-        return  # Can't find blip, skip this image
+        paragraph._element.remove(inline_xml)
+        return
     
     # Extract the relationship ID
-    rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+    rId = None
+    for attr_name, attr_value in blip.attrib.items():
+        if 'embed' in attr_name.lower():
+            rId = attr_value
+            break
     
     if not rId:
-        return  # No rId found, skip
+        paragraph._element.remove(inline_xml)
+        return
     
-    # Now remove the inline image run and create a floating one
+    # Remove the inline image run
     paragraph._element.remove(inline_xml)
     
     behind = "1" if behind_doc else "0"
@@ -163,94 +234,9 @@ def _add_floating_image(
     paragraph._element.append(run_element)
 
 
-# ── Invisible text box for searchable overlay ─────────────────────────────────
+# ── Floating text box insertion ───────────────────────────────────────────────
 
-def _add_invisible_textbox(
-    paragraph,
-    text: str,
-    x_emu: int,
-    y_emu: int,
-    w_emu: int,
-    h_emu: int,
-    shape_id: int,
-    font_size_half_pt: int = 20,
-) -> None:
-    """Add an invisible (transparent) text box for searchability."""
-    escaped_text = _escape(text)
-    
-    # Use white color with 0% opacity (invisible but selectable)
-    xml = (
-        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
-        '     xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
-        '     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
-        '     xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
-        '     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
-        "<mc:AlternateContent>"
-        '<mc:Choice Requires="wps"><w:drawing>'
-        '<wp:anchor distT="0" distB="0" distL="0" distR="0"'
-        ' simplePos="0" relativeHeight="{z}"'
-        ' behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
-        '<wp:simplePos x="0" y="0"/>'
-        '<wp:positionH relativeFrom="page">'
-        "  <wp:posOffset>{x}</wp:posOffset>"
-        "</wp:positionH>"
-        '<wp:positionV relativeFrom="page">'
-        "  <wp:posOffset>{y}</wp:posOffset>"
-        "</wp:positionV>"
-        '<wp:extent cx="{cx}" cy="{cy}"/>'
-        '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
-        "<wp:wrapNone/>"
-        '<wp:docPr id="{sid}" name="TB{sid}"/>'
-        "<wp:cNvGraphicFramePr/>"
-        "<a:graphic>"
-        '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
-        "<wps:wsp>"
-        '<wps:cNvSpPr txBox="1"/>'
-        "<wps:spPr>"
-        '  <a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
-        '  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
-        "  <a:noFill/><a:ln><a:noFill/></a:ln>"
-        "</wps:spPr>"
-        "<wps:txbx><w:txbxContent>"
-        '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="240" w:lineRule="auto"/>'
-        "</w:pPr>"
-        "<w:r><w:rPr>"
-        '<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>'
-        '<w:color w:val="FFFFFF"/>'  
-        '<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
-        '<w:vanish/>'  # Makes text invisible but still searchable
-        "</w:rPr>"
-        '<w:t xml:space="preserve">{text}</w:t>'
-        "</w:r>"
-        "</w:p>"
-        "</w:txbxContent></wps:txbx>"
-        '<wps:bodyPr wrap="square" lIns="0" tIns="0" rIns="0" bIns="0"'
-        ' anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>'
-        "</wps:wsp>"
-        "</a:graphicData></a:graphic>"
-        "</wp:anchor>"
-        "</w:drawing></mc:Choice>"
-        "<mc:Fallback><w:pict/></mc:Fallback>"
-        "</mc:AlternateContent>"
-        "</w:r>"
-    ).format(
-        x=x_emu,
-        y=y_emu,
-        cx=w_emu,
-        cy=h_emu,
-        sid=shape_id,
-        z=251700000 + shape_id,
-        sz=font_size_half_pt,
-        text=escaped_text,
-    )
-
-    run_element = parse_xml(xml)
-    paragraph._element.append(run_element)
-
-
-# ── Visible text box for editable mode ────────────────────────────────────────
-
-def _add_visible_textbox(
+def _add_textbox(
     paragraph,
     text: str,
     x_emu: int,
@@ -263,8 +249,9 @@ def _add_visible_textbox(
     bold: bool = False,
     italic: bool = False,
     color_hex: str = "000000",
+    underline: bool = False,
 ) -> None:
-    """Add a visible, editable text box."""
+    """Add a visible, editable text box at exact position."""
     escaped_text = _escape(text)
     escaped_font = _escape(font_name)
     
@@ -273,61 +260,62 @@ def _add_visible_textbox(
         flags += "<w:b/>"
     if italic:
         flags += "<w:i/>"
+    if underline:
+        flags += '<w:u w:val="single"/>'
     
     xml = (
         '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
-        '     xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
-        '     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
-        '     xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
-        '     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
-        "<mc:AlternateContent>"
+        ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+        ' xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
+        ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+        '<mc:AlternateContent>'
         '<mc:Choice Requires="wps"><w:drawing>'
         '<wp:anchor distT="0" distB="0" distL="0" distR="0"'
         ' simplePos="0" relativeHeight="{z}"'
         ' behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
         '<wp:simplePos x="0" y="0"/>'
         '<wp:positionH relativeFrom="page">'
-        "  <wp:posOffset>{x}</wp:posOffset>"
-        "</wp:positionH>"
+        '<wp:posOffset>{x}</wp:posOffset>'
+        '</wp:positionH>'
         '<wp:positionV relativeFrom="page">'
-        "  <wp:posOffset>{y}</wp:posOffset>"
-        "</wp:positionV>"
+        '<wp:posOffset>{y}</wp:posOffset>'
+        '</wp:positionV>'
         '<wp:extent cx="{cx}" cy="{cy}"/>'
         '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
-        "<wp:wrapNone/>"
+        '<wp:wrapNone/>'
         '<wp:docPr id="{sid}" name="TB{sid}"/>'
-        "<wp:cNvGraphicFramePr/>"
-        "<a:graphic>"
+        '<wp:cNvGraphicFramePr/>'
+        '<a:graphic>'
         '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
-        "<wps:wsp>"
+        '<wps:wsp>'
         '<wps:cNvSpPr txBox="1"/>'
-        "<wps:spPr>"
-        '  <a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
-        '  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
-        "  <a:noFill/><a:ln><a:noFill/></a:ln>"
-        "</wps:spPr>"
-        "<wps:txbx><w:txbxContent>"
-        '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="240" w:lineRule="auto"/>'
-        "</w:pPr>"
-        "<w:r><w:rPr>"
+        '<wps:spPr>'
+        '<a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '<a:noFill/><a:ln><a:noFill/></a:ln>'
+        '</wps:spPr>'
+        '<wps:txbx><w:txbxContent>'
+        '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="240" w:lineRule="auto"/></w:pPr>'
+        '<w:r><w:rPr>'
         '<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}"/>'
-        "{flags}"
+        '{flags}'
         '<w:color w:val="{color}"/>'
         '<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
-        "</w:rPr>"
+        '</w:rPr>'
         '<w:t xml:space="preserve">{text}</w:t>'
-        "</w:r>"
-        "</w:p>"
-        "</w:txbxContent></wps:txbx>"
+        '</w:r>'
+        '</w:p>'
+        '</w:txbxContent></wps:txbx>'
         '<wps:bodyPr wrap="square" lIns="0" tIns="0" rIns="0" bIns="0"'
         ' anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>'
-        "</wps:wsp>"
-        "</a:graphicData></a:graphic>"
-        "</wp:anchor>"
-        "</w:drawing></mc:Choice>"
-        "<mc:Fallback><w:pict/></mc:Fallback>"
-        "</mc:AlternateContent>"
-        "</w:r>"
+        '</wps:wsp>'
+        '</a:graphicData></a:graphic>'
+        '</wp:anchor>'
+        '</w:drawing></mc:Choice>'
+        '<mc:Fallback><w:pict/></mc:Fallback>'
+        '</mc:AlternateContent>'
+        '</w:r>'
     ).format(
         x=x_emu,
         y=y_emu,
@@ -346,58 +334,201 @@ def _add_visible_textbox(
     paragraph._element.append(run_element)
 
 
-# ── Color conversion ──────────────────────────────────────────────────────────
+# ── Rectangle/Line shape insertion ────────────────────────────────────────────
 
-def _color_to_hex(color) -> str:
-    """Convert a PyMuPDF colour (int, tuple, list, or None) to 6-char hex."""
-    if color is None:
-        return "000000"
-    if isinstance(color, (tuple, list)):
-        if len(color) >= 3:
-            r, g, b = int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
-            return f"{r:02X}{g:02X}{b:02X}"
-        if len(color) == 1:
-            v = int(color[0] * 255)
-            return f"{v:02X}{v:02X}{v:02X}"
-        return "000000"
-    if isinstance(color, float):
-        v = int(color * 255)
-        return f"{v:02X}{v:02X}{v:02X}"
-    # int (sRGB packed)
-    r = (color >> 16) & 0xFF
-    g = (color >> 8) & 0xFF
-    b = color & 0xFF
-    return f"{r:02X}{g:02X}{b:02X}"
+def _add_rect_shape(
+    paragraph,
+    x_emu: int,
+    y_emu: int,
+    w_emu: int,
+    h_emu: int,
+    shape_id: int,
+    stroke_color: str = "000000",
+    fill_color: Optional[str] = None,
+    stroke_width_emu: int = 12700,
+) -> None:
+    """Add a rectangle shape at exact position."""
+    if w_emu <= 0 or h_emu <= 0:
+        return
+    
+    fill_xml = f'<a:solidFill><a:srgbClr val="{fill_color}"/></a:solidFill>' if fill_color else '<a:noFill/>'
+    
+    xml = (
+        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+        ' xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
+        ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+        '<mc:AlternateContent>'
+        '<mc:Choice Requires="wps"><w:drawing>'
+        '<wp:anchor distT="0" distB="0" distL="0" distR="0"'
+        ' simplePos="0" relativeHeight="{z}"'
+        ' behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">'
+        '<wp:simplePos x="0" y="0"/>'
+        '<wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH>'
+        '<wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
+        '<wp:extent cx="{cx}" cy="{cy}"/>'
+        '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
+        '<wp:wrapNone/>'
+        '<wp:docPr id="{sid}" name="R{sid}"/>'
+        '<wp:cNvGraphicFramePr/>'
+        '<a:graphic>'
+        '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        '<wps:wsp>'
+        '<wps:cNvSpPr/>'
+        '<wps:spPr>'
+        '<a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '{fill}'
+        '<a:ln w="{lw}"><a:solidFill><a:srgbClr val="{stroke}"/></a:solidFill></a:ln>'
+        '</wps:spPr>'
+        '<wps:bodyPr/>'
+        '</wps:wsp>'
+        '</a:graphicData></a:graphic>'
+        '</wp:anchor>'
+        '</w:drawing></mc:Choice>'
+        '<mc:Fallback><w:pict/></mc:Fallback>'
+        '</mc:AlternateContent>'
+        '</w:r>'
+    ).format(
+        x=x_emu, y=y_emu, cx=w_emu, cy=h_emu,
+        sid=shape_id, z=251600000 + shape_id,
+        stroke=stroke_color, fill=fill_xml, lw=stroke_width_emu,
+    )
+    
+    paragraph._element.append(parse_xml(xml))
 
 
-# ── Page rendering ────────────────────────────────────────────────────────────
+def _add_line_shape(
+    paragraph,
+    x0_emu: int,
+    y0_emu: int,
+    x1_emu: int,
+    y1_emu: int,
+    shape_id: int,
+    color: str = "000000",
+    width_emu: int = 12700,
+) -> None:
+    """Add a line shape."""
+    bx = min(x0_emu, x1_emu)
+    by = min(y0_emu, y1_emu)
+    bw = abs(x1_emu - x0_emu) or width_emu
+    bh = abs(y1_emu - y0_emu) or width_emu
+    
+    flipH = "1" if x1_emu < x0_emu else "0"
+    flipV = "1" if y1_emu < y0_emu else "0"
+    
+    xml = (
+        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+        ' xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
+        ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+        '<mc:AlternateContent>'
+        '<mc:Choice Requires="wps"><w:drawing>'
+        '<wp:anchor distT="0" distB="0" distL="0" distR="0"'
+        ' simplePos="0" relativeHeight="{z}"'
+        ' behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">'
+        '<wp:simplePos x="0" y="0"/>'
+        '<wp:positionH relativeFrom="page"><wp:posOffset>{bx}</wp:posOffset></wp:positionH>'
+        '<wp:positionV relativeFrom="page"><wp:posOffset>{by}</wp:posOffset></wp:positionV>'
+        '<wp:extent cx="{bw}" cy="{bh}"/>'
+        '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
+        '<wp:wrapNone/>'
+        '<wp:docPr id="{sid}" name="L{sid}"/>'
+        '<wp:cNvGraphicFramePr/>'
+        '<a:graphic>'
+        '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        '<wps:wsp>'
+        '<wps:cNvCnPr/>'
+        '<wps:spPr>'
+        '<a:xfrm flipH="{fH}" flipV="{fV}">'
+        '<a:off x="0" y="0"/><a:ext cx="{bw}" cy="{bh}"/></a:xfrm>'
+        '<a:prstGeom prst="line"><a:avLst/></a:prstGeom>'
+        '<a:ln w="{lw}"><a:solidFill><a:srgbClr val="{color}"/></a:solidFill></a:ln>'
+        '</wps:spPr>'
+        '<wps:bodyPr/>'
+        '</wps:wsp>'
+        '</a:graphicData></a:graphic>'
+        '</wp:anchor>'
+        '</w:drawing></mc:Choice>'
+        '<mc:Fallback><w:pict/></mc:Fallback>'
+        '</mc:AlternateContent>'
+        '</w:r>'
+    ).format(
+        bx=bx, by=by, bw=bw, bh=bh,
+        sid=shape_id, z=251600000 + shape_id,
+        color=color, lw=width_emu,
+        fH=flipH, fV=flipV,
+    )
+    
+    paragraph._element.append(parse_xml(xml))
 
-def _render_page_as_image(page: fitz.Page, dpi: int = 300) -> bytes:
-    """Render entire page as a high-resolution PNG image."""
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    return pix.tobytes("png")
+
+# ── Text line grouping for better layout ──────────────────────────────────────
+
+def _group_spans_by_line(blocks: List[Dict]) -> List[Dict[str, Any]]:
+    """
+    Group text spans into logical lines based on vertical position.
+    Returns a list of line dictionaries with combined text and positioning.
+    """
+    lines = []
+    
+    for block in blocks:
+        if block.get("type") != 0:  # Not a text block
+            continue
+        
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            
+            # Get line bounding box
+            line_bbox = list(line.get("bbox", [0, 0, 0, 0]))
+            
+            # Collect all spans in this line
+            line_spans = []
+            for span in spans:
+                text = span.get("text", "")
+                if not text:
+                    continue
+                
+                line_spans.append({
+                    "text": text,
+                    "bbox": span.get("bbox"),
+                    "font": span.get("font", "Arial"),
+                    "size": span.get("size", 10),
+                    "flags": span.get("flags", 0),
+                    "color": span.get("color", 0),
+                })
+            
+            if line_spans:
+                lines.append({
+                    "bbox": line_bbox,
+                    "spans": line_spans,
+                })
+    
+    return lines
 
 
-def _process_page_exact(
+# ── Page processing for editable mode ─────────────────────────────────────────
+
+def _process_page_editable(
     pdf_doc: fitz.Document,
     word_doc: Document,
     page: fitz.Page,
     is_first: bool,
-    dpi: int = 300,
-    include_text_layer: bool = True,
+    dpi: int = 200,
+    verbose: bool = False,
 ) -> None:
     """
-    Convert one PDF page using EXACT mode:
-    - Render entire page as background image
-    - Overlay invisible text for searchability
+    Process a PDF page in editable mode with improved layout handling.
     """
     rect = page.rect
     w_emu = _pt2emu(rect.width)
     h_emu = _pt2emu(rect.height)
 
-    # ── Set up DOCX section matching PDF page size ───────────────────────
+    # Set up DOCX section
     if is_first:
         section = word_doc.sections[0]
     else:
@@ -420,13 +551,255 @@ def _process_page_exact(
     section.header_distance = Emu(0)
     section.footer_distance = Emu(0)
 
-    # One anchor paragraph per page
     anchor_para = word_doc.add_paragraph()
     anchor_para.paragraph_format.space_before = Pt(0)
     anchor_para.paragraph_format.space_after = Pt(0)
 
-    # ── Render entire page as background image ────────────────────────────
-    img_bytes = _render_page_as_image(page, dpi=dpi)
+    # ── Step 1: Extract and place images ──────────────────────────────────
+    image_rects = []  # Track image positions
+    
+    image_list = page.get_images(full=True)
+    processed_xrefs = set()
+    
+    for img_info in image_list:
+        xref = img_info[0]
+        if xref in processed_xrefs:
+            continue
+        processed_xrefs.add(xref)
+        
+        try:
+            img_rects = page.get_image_rects(xref)
+            if not img_rects:
+                continue
+            
+            base_image = pdf_doc.extract_image(xref)
+            if not base_image or not base_image.get("image"):
+                continue
+            
+            img_bytes = base_image["image"]
+            
+            for img_rect in img_rects:
+                if img_rect.width <= 0 or img_rect.height <= 0:
+                    continue
+                
+                image_rects.append(fitz.Rect(img_rect))
+                
+                _add_floating_image(
+                    word_doc,
+                    anchor_para,
+                    img_bytes,
+                    _pt2emu(img_rect.x0),
+                    _pt2emu(img_rect.y0),
+                    _pt2emu(img_rect.width),
+                    _pt2emu(img_rect.height),
+                    _next_shape_id(),
+                    behind_doc=True,
+                )
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: Failed to extract image: {e}", file=sys.stderr)
+            continue
+
+    # ── Step 2: Extract and place drawings/shapes ─────────────────────────
+    drawings = page.get_drawings()
+    complex_regions = []  # Regions that need rasterization
+    
+    for drawing in drawings:
+        items = drawing.get("items", [])
+        draw_rect = drawing.get("rect")
+        stroke_color = _color_to_hex(drawing.get("color"))
+        fill_color = drawing.get("fill")
+        fill_hex = _color_to_hex(fill_color) if fill_color is not None else None
+        stroke_width = drawing.get("width", 1) or 1
+        
+        # Check for complex paths (curves)
+        has_curves = any(item[0] in ("c", "qu", "curve") for item in items)
+        
+        if has_curves and draw_rect:
+            # Mark for rasterization
+            complex_regions.append(fitz.Rect(draw_rect))
+            continue
+        
+        # Process simple shapes
+        for item in items:
+            kind = item[0]
+            
+            if kind == "re":  # Rectangle
+                r = item[1]
+                _add_rect_shape(
+                    anchor_para,
+                    _pt2emu(r.x0),
+                    _pt2emu(r.y0),
+                    _pt2emu(r.width),
+                    _pt2emu(r.height),
+                    _next_shape_id(),
+                    stroke_color=stroke_color,
+                    fill_color=fill_hex,
+                    stroke_width_emu=max(_pt2emu(stroke_width), 6350),
+                )
+            
+            elif kind == "l":  # Line
+                p1, p2 = item[1], item[2]
+                _add_line_shape(
+                    anchor_para,
+                    _pt2emu(p1.x),
+                    _pt2emu(p1.y),
+                    _pt2emu(p2.x),
+                    _pt2emu(p2.y),
+                    _next_shape_id(),
+                    color=stroke_color,
+                    width_emu=max(_pt2emu(stroke_width), 6350),
+                )
+    
+    # Rasterize complex regions
+    merged_complex = _merge_rects(complex_regions) if complex_regions else []
+    
+    for region in merged_complex:
+        if region.width < 5 or region.height < 5:
+            continue
+        
+        try:
+            zoom = min(dpi, 200) / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, clip=region, alpha=False)
+            img_bytes = pix.tobytes("png")
+            
+            _add_floating_image(
+                word_doc,
+                anchor_para,
+                img_bytes,
+                _pt2emu(region.x0),
+                _pt2emu(region.y0),
+                _pt2emu(region.width),
+                _pt2emu(region.height),
+                _next_shape_id(),
+                behind_doc=True,
+            )
+        except Exception:
+            continue
+
+    # ── Step 3: Extract and place text ────────────────────────────────────
+    text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)
+    blocks = text_dict.get("blocks", [])
+    
+    # Group spans by line for better handling
+    lines = _group_spans_by_line(blocks)
+    
+    for line_info in lines:
+        line_bbox = line_info["bbox"]
+        spans = line_info["spans"]
+        
+        # Process each span in the line
+        for span in spans:
+            text = span["text"]
+            if not text.strip():
+                continue
+            
+            bbox = span["bbox"]
+            font = span["font"]
+            size = span["size"]
+            flags = span["flags"]
+            color = span["color"]
+            
+            # Parse flags
+            is_bold = bool(flags & (1 << 4))
+            is_italic = bool(flags & (1 << 1))
+            is_superscript = bool(flags & 1)
+            
+            # Clean font name
+            clean_font = font
+            if "+" in clean_font:
+                clean_font = clean_font.split("+", 1)[1]
+            
+            # Calculate position and size
+            x_emu = _pt2emu(bbox[0])
+            y_emu = _pt2emu(bbox[1])
+            
+            # Calculate width more accurately
+            pdf_width = bbox[2] - bbox[0]
+            estimated_width = _estimate_text_width(text, size, clean_font)
+            
+            # Use PDF width but ensure it's at least as wide as estimated
+            final_width = max(pdf_width, estimated_width)
+            
+            # Add padding to prevent clipping
+            final_width *= 1.1
+            
+            # Height with padding for descenders
+            final_height = max(bbox[3] - bbox[1], size * 1.4)
+            
+            box_w = _pt2emu(final_width)
+            box_h = _pt2emu(final_height)
+            
+            # Font size in half-points
+            size_half_pt = max(int(round(size * 2)), 2)
+            
+            color_hex = _color_to_hex(color)
+            
+            _add_textbox(
+                anchor_para,
+                text,
+                x_emu,
+                y_emu,
+                box_w,
+                box_h,
+                _next_shape_id(),
+                font_name=clean_font,
+                font_size_half_pt=size_half_pt,
+                bold=is_bold,
+                italic=is_italic,
+                color_hex=color_hex,
+            )
+
+
+# ── Page processing for exact mode ────────────────────────────────────────────
+
+def _process_page_exact(
+    pdf_doc: fitz.Document,
+    word_doc: Document,
+    page: fitz.Page,
+    is_first: bool,
+    dpi: int = 300,
+) -> None:
+    """
+    Process a PDF page in exact mode - render as background image.
+    """
+    rect = page.rect
+    w_emu = _pt2emu(rect.width)
+    h_emu = _pt2emu(rect.height)
+
+    # Set up DOCX section
+    if is_first:
+        section = word_doc.sections[0]
+    else:
+        section = word_doc.add_section()
+
+    landscape = rect.width > rect.height
+    if landscape:
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width = Emu(max(w_emu, h_emu))
+        section.page_height = Emu(min(w_emu, h_emu))
+    else:
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width = Emu(w_emu)
+        section.page_height = Emu(h_emu)
+
+    section.top_margin = Emu(0)
+    section.bottom_margin = Emu(0)
+    section.left_margin = Emu(0)
+    section.right_margin = Emu(0)
+    section.header_distance = Emu(0)
+    section.footer_distance = Emu(0)
+
+    anchor_para = word_doc.add_paragraph()
+    anchor_para.paragraph_format.space_before = Pt(0)
+    anchor_para.paragraph_format.space_after = Pt(0)
+
+    # Render entire page as image
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img_bytes = pix.tobytes("png")
     
     _add_floating_image(
         word_doc,
@@ -440,223 +813,8 @@ def _process_page_exact(
         behind_doc=True,
     )
 
-    # ── Overlay invisible text for searchability ──────────────────────────
-    if include_text_layer:
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-        
-        for block in blocks:
-            if block["type"] != 0:  # 0 = text block
-                continue
-            
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    text = span["text"]
-                    if not text or not text.strip():
-                        continue
-                    
-                    bbox = span["bbox"]
-                    size = span["size"]
-                    
-                    x_emu = _pt2emu(bbox[0])
-                    y_emu = _pt2emu(bbox[1])
-                    box_w = _pt2emu(bbox[2] - bbox[0])
-                    box_h = _pt2emu(bbox[3] - bbox[1])
-                    
-                    # Ensure minimum size
-                    box_w = max(box_w, _pt2emu(len(text) * size * 0.5))
-                    box_h = max(box_h, _pt2emu(size * 1.2))
-                    
-                    size_half_pt = max(int(round(size * 2)), 2)
-                    
-                    _add_invisible_textbox(
-                        anchor_para,
-                        text,
-                        x_emu,
-                        y_emu,
-                        box_w,
-                        box_h,
-                        _next_shape_id(),
-                        font_size_half_pt=size_half_pt,
-                    )
 
-
-def _process_page_editable(
-    pdf_doc: fitz.Document,
-    word_doc: Document,
-    page: fitz.Page,
-    is_first: bool,
-    dpi: int = 300,
-) -> None:
-    """
-    Convert one PDF page using EDITABLE mode:
-    - Extract and place images at exact positions
-    - Place text as visible editable text boxes
-    - Render complex graphics as images
-    """
-    rect = page.rect
-    w_emu = _pt2emu(rect.width)
-    h_emu = _pt2emu(rect.height)
-
-    # ── Set up DOCX section matching PDF page size ───────────────────────
-    if is_first:
-        section = word_doc.sections[0]
-    else:
-        section = word_doc.add_section()
-
-    landscape = rect.width > rect.height
-    if landscape:
-        section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_width = Emu(max(w_emu, h_emu))
-        section.page_height = Emu(min(w_emu, h_emu))
-    else:
-        section.orientation = WD_ORIENT.PORTRAIT
-        section.page_width = Emu(w_emu)
-        section.page_height = Emu(h_emu)
-
-    section.top_margin = Emu(0)
-    section.bottom_margin = Emu(0)
-    section.left_margin = Emu(0)
-    section.right_margin = Emu(0)
-    section.header_distance = Emu(0)
-    section.footer_distance = Emu(0)
-
-    anchor_para = word_doc.add_paragraph()
-    anchor_para.paragraph_format.space_before = Pt(0)
-    anchor_para.paragraph_format.space_after = Pt(0)
-
-    # ── Extract and render graphics/images ────────────────────────────────
-    # First, identify all drawable regions
-    drawings = page.get_drawings()
-    
-    # Collect regions that need rasterization
-    raster_regions: List[fitz.Rect] = []
-    
-    for drawing in drawings:
-        draw_rect = drawing.get("rect")
-        if draw_rect and draw_rect.width > 2 and draw_rect.height > 2:
-            raster_regions.append(fitz.Rect(draw_rect))
-    
-    # Extract embedded images
-    image_list = page.get_images(full=True)
-    image_rects: List[fitz.Rect] = []
-    
-    for img_info in image_list:
-        xref = img_info[0]
-        try:
-            img_rects = page.get_image_rects(xref)
-            for img_rect in (img_rects or []):
-                if img_rect.width > 0 and img_rect.height > 0:
-                    image_rects.append(fitz.Rect(img_rect))
-                    
-                    base_image = pdf_doc.extract_image(xref)
-                    if base_image and base_image.get("image"):
-                        img_bytes = base_image["image"]
-                        _add_floating_image(
-                            word_doc,
-                            anchor_para,
-                            img_bytes,
-                            _pt2emu(img_rect.x0),
-                            _pt2emu(img_rect.y0),
-                            _pt2emu(img_rect.width),
-                            _pt2emu(img_rect.height),
-                            _next_shape_id(),
-                            behind_doc=True,
-                        )
-        except Exception:
-            continue
-    
-    # Render complex graphics regions
-    if raster_regions:
-        # Merge overlapping regions
-        merged = _merge_rects(raster_regions)
-        
-        for region in merged:
-            # Skip if this region is just an image
-            is_image_region = any(
-                ir.contains(region) or region.contains(ir) 
-                for ir in image_rects
-            )
-            if is_image_region:
-                continue
-            
-            # Skip tiny regions
-            if region.width < 10 or region.height < 10:
-                continue
-            
-            try:
-                zoom = min(dpi, 200) / 72.0
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat, clip=region, alpha=False)
-                img_bytes = pix.tobytes("png")
-                
-                _add_floating_image(
-                    word_doc,
-                    anchor_para,
-                    img_bytes,
-                    _pt2emu(region.x0),
-                    _pt2emu(region.y0),
-                    _pt2emu(region.width),
-                    _pt2emu(region.height),
-                    _next_shape_id(),
-                    behind_doc=True,
-                )
-            except Exception:
-                continue
-
-    # ── Extract and place text ────────────────────────────────────────────
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)["blocks"]
-
-    for block in blocks:
-        if block["type"] != 0:
-            continue
-
-        for line in block["lines"]:
-            for span in line["spans"]:
-                text = span["text"]
-                if not text or text.isspace():
-                    continue
-
-                bbox = span["bbox"]
-                font = span["font"]
-                size = span["size"]
-                flags = span["flags"]
-                color = span["color"]
-
-                is_bold = bool(flags & 2 ** 4)
-                is_italic = bool(flags & 2 ** 1)
-                
-                size_half_pt = max(int(round(size * 2)), 2)
-                color_hex = _color_to_hex(color)
-
-                clean_font = font
-                if "+" in clean_font:
-                    clean_font = clean_font.split("+", 1)[1]
-
-                x_emu = _pt2emu(bbox[0])
-                y_emu = _pt2emu(bbox[1])
-                
-                pdf_width = bbox[2] - bbox[0]
-                pdf_height = bbox[3] - bbox[1]
-                
-                # Add generous padding for text width
-                box_w = _pt2emu(max(pdf_width * 1.3, len(text) * size * 0.7))
-                box_h = _pt2emu(max(pdf_height, size * 1.6))
-
-                _add_visible_textbox(
-                    anchor_para,
-                    text,
-                    x_emu,
-                    y_emu,
-                    box_w,
-                    box_h,
-                    _next_shape_id(),
-                    font_name=clean_font,
-                    font_size_half_pt=size_half_pt,
-                    bold=is_bold,
-                    italic=is_italic,
-                    color_hex=color_hex,
-                )
-
+# ── Helper: Merge overlapping rectangles ──────────────────────────────────────
 
 def _merge_rects(rects: List[fitz.Rect], margin: float = 5) -> List[fitz.Rect]:
     """Merge overlapping or nearby rectangles."""
@@ -707,7 +865,7 @@ def convert_pdf_to_docx(
     *,
     pages: Optional[Sequence[int]] = None,
     dpi: int = 300,
-    mode: Literal["exact", "editable"] = "exact",
+    mode: Literal["exact", "editable"] = "editable",
     verbose: bool = False,
 ) -> Path:
     """Convert a PDF to a DOCX document.
@@ -722,10 +880,11 @@ def convert_pdf_to_docx(
         0-based page indices. ``None`` → all pages.
     dpi:
         Resolution for rendering (higher = sharper but larger file).
-        Default is 300 for print quality.
+        For editable mode, this affects complex graphics quality.
+        For exact mode, this affects overall quality.
     mode:
-        - "exact": Renders pages as images for perfect visual match (default)
-        - "editable": Extracts text as editable boxes (may have layout issues)
+        - "editable" (default): Extracts text, images, shapes as editable elements
+        - "exact": Renders pages as images for perfect visual match
     verbose:
         Print progress to stderr.
     
@@ -753,32 +912,23 @@ def convert_pdf_to_docx(
     page_indices = list(pages) if pages is not None else list(range(len(pdf_doc)))
     total = len(page_indices)
 
+    if verbose:
+        print(f"Converting {pdf_path.name} ({total} pages, {mode} mode)...", file=sys.stderr)
+
     for i, idx in enumerate(page_indices):
         page = pdf_doc[idx]
         if verbose:
-            print(
-                f"  [{i + 1}/{total}] Processing page {idx + 1} ({mode} mode)…",
-                file=sys.stderr,
-            )
+            print(f"  [{i + 1}/{total}] Processing page {idx + 1}...", file=sys.stderr)
         
         if mode == "exact":
-            _process_page_exact(
-                pdf_doc, word_doc, page, 
-                is_first=(i == 0), 
-                dpi=dpi,
-                include_text_layer=True,
-            )
+            _process_page_exact(pdf_doc, word_doc, page, is_first=(i == 0), dpi=dpi)
         else:
-            _process_page_editable(
-                pdf_doc, word_doc, page,
-                is_first=(i == 0),
-                dpi=dpi,
-            )
+            _process_page_editable(pdf_doc, word_doc, page, is_first=(i == 0), dpi=dpi, verbose=verbose)
 
     word_doc.save(str(docx_path))
     pdf_doc.close()
 
     if verbose:
-        print("Done.", file=sys.stderr)
+        print(f"Done. Saved to: {docx_path}", file=sys.stderr)
 
     return docx_path

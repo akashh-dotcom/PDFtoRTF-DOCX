@@ -40,10 +40,10 @@ def main(argv: list[str] | None = None) -> None:
         "-m",
         "--mode",
         choices=["exact", "editable"],
-        default="exact",
-        help="Conversion mode: 'exact' renders pages as images for perfect "
-        "visual fidelity (default), 'editable' extracts text as editable "
-        "boxes (may have layout issues with complex PDFs).",
+        default="editable",
+        help="Conversion mode: 'editable' (default) extracts text, images, "
+        "and shapes as fully editable elements. 'exact' renders pages as "
+        "images for perfect visual match but limited editability.",
     )
     parser.add_argument(
         "-v",
