@@ -64,7 +64,15 @@ def _add_floating_image(
 ) -> None:
     """Insert a floating image at an exact page position."""
     # Add image to the document's media and get the relationship ID
-    image_part, rId = doc.part.get_or_add_image_part(io.BytesIO(image_bytes))
+    # Handle different python-docx versions
+    image_stream = io.BytesIO(image_bytes)
+    
+    try:
+        # Try newer API first
+        image_part, rId = doc.part.get_or_add_image(image_stream)
+    except AttributeError:
+        # Fall back to older API
+        image_part, rId = doc.part.get_or_add_image_part(image_stream)
     
     behind = "1" if behind_doc else "0"
 
