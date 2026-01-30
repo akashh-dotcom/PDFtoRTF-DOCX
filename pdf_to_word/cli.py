@@ -23,6 +23,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Output DOCX path. Defaults to <input>.docx.",
     )
     parser.add_argument(
+        "-m",
+        "--mode",
+        choices=["image", "text", "hybrid"],
+        default="image",
+        help=(
+            "Conversion mode (default: image). "
+            "'image'  = pixel-perfect, each page rendered as a high-res image. "
+            "'text'   = editable text via pdf2docx (may have layout issues). "
+            "'hybrid' = pdf2docx with automatic image fallback for bad pages."
+        ),
+    )
+    parser.add_argument(
         "-p",
         "--pages",
         default=None,
@@ -33,7 +45,7 @@ def main(argv: list[str] | None = None) -> None:
         "--dpi",
         type=int,
         default=300,
-        help="DPI for image-based fallback rendering (default: 300).",
+        help="DPI for image-based rendering (default: 300).",
     )
     parser.add_argument(
         "-v",
@@ -62,6 +74,7 @@ def main(argv: list[str] | None = None) -> None:
         args.output,
         pages=pages,
         dpi=args.dpi,
+        mode=args.mode,
         verbose=args.verbose,
     )
 
