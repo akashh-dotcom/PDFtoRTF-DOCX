@@ -12,6 +12,7 @@ and line-shift artefacts), this module:
    box is fully editable in Word.
 4. Extracts and inserts images as floating pictures at their exact position.
 5. Draws table borders / rectangles as shapes.
+6. Renders complex graphics (path-based text, filled shapes) as rasterized images.
 
 The result is an editable DOCX that visually matches the PDF character-by-
 character.
@@ -25,7 +26,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, List, Tuple, Dict, Any
 
 import fitz  # PyMuPDF
 from docx import Document
@@ -33,6 +34,7 @@ from docx.enum.section import WD_ORIENT
 from docx.oxml import parse_xml
 from docx.oxml.ns import qn
 from docx.shared import Emu, Pt
+from PIL import Image
 
 
 # ── Unit helpers ─────────────────────────────────────────────────────────────
@@ -43,6 +45,44 @@ _PDF_PT_TO_EMU = _PT_TO_EMU  # PDF points → EMU (1:1 since both use 72 dpi)
 
 def _pt2emu(pt: float) -> int:
     return int(pt * _PT_TO_EMU)
+
+
+# ── Character width estimation for better text box sizing ─────────────────────
+
+# Approximate character width multipliers for common font categories
+_CHAR_WIDTH_FACTORS = {
+    # Narrow characters
+    'i': 0.35, 'l': 0.35, 'I': 0.35, '1': 0.55, '.': 0.35, ',': 0.35, 
+    ':': 0.35, ';': 0.35, '!': 0.35, "'": 0.25, '"': 0.45, '|': 0.35,
+    'j': 0.40, 'f': 0.40, 't': 0.45, 'r': 0.45,
+    # Wide characters  
+    'w': 0.85, 'm': 0.90, 'W': 1.00, 'M': 0.95, '@': 0.95, '%': 0.90,
+    # Default for normal width characters
+}
+_DEFAULT_CHAR_WIDTH = 0.60
+
+
+def _estimate_text_width(text: str, font_size: float, font_name: str = "") -> float:
+    """Estimate text width in points based on character composition."""
+    if not text:
+        return 0
+    
+    # Check if it's a monospace font
+    mono_indicators = ['mono', 'courier', 'consolas', 'menlo', 'fixed']
+    is_mono = any(ind in font_name.lower() for ind in mono_indicators)
+    
+    if is_mono:
+        # Monospace: all characters have same width (approx 0.6 * font_size)
+        return len(text) * font_size * 0.62
+    
+    # Variable width: estimate per character
+    total_width = 0.0
+    for char in text:
+        factor = _CHAR_WIDTH_FACTORS.get(char, _DEFAULT_CHAR_WIDTH)
+        total_width += font_size * factor
+    
+    # Add a small buffer to prevent clipping
+    return total_width * 1.05
 
 
 # ── Floating text box builder ────────────────────────────────────────────────
@@ -69,8 +109,15 @@ def _make_run_xml(
     color_hex: str = "000000",
     superscript: bool = False,
     subscript: bool = False,
+    char_spacing_twips: int = 0,
 ) -> str:
-    """Build a ``<w:r>`` XML fragment for one styled text span."""
+    """Build a ``<w:r>`` XML fragment for one styled text span.
+    
+    Parameters
+    ----------
+    char_spacing_twips:
+        Character spacing in twips (1/20 of a point). Positive = expand, negative = condense.
+    """
     flags = ""
     if bold:
         flags += "<w:b/>"
@@ -80,6 +127,9 @@ def _make_run_xml(
         flags += '<w:vertAlign w:val="superscript"/>'
     elif subscript:
         flags += '<w:vertAlign w:val="subscript"/>'
+    if char_spacing_twips != 0:
+        flags += f'<w:spacing w:val="{char_spacing_twips}"/>'
+    
     return (
         "<w:r><w:rPr>"
         '<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}" w:eastAsia="{font}"/>'
@@ -167,6 +217,115 @@ def _add_textbox(
 
     run_element = parse_xml(xml)
     paragraph._element.append(run_element)
+
+
+# ── Complex graphics detection and rasterization ─────────────────────────────
+
+def _has_complex_graphics(page: fitz.Page) -> List[fitz.Rect]:
+    """
+    Detect regions with complex graphics (filled paths, gradients, etc.)
+    that need to be rasterized for proper rendering.
+    
+    Returns a list of rectangles containing complex graphics.
+    """
+    complex_regions = []
+    
+    drawings = page.get_drawings()
+    
+    for drawing in drawings:
+        draw_fill = drawing.get("fill")
+        draw_color = drawing.get("color")
+        items = drawing.get("items", [])
+        
+        # Check for complex path elements (curves, filled shapes)
+        has_curves = False
+        has_fill = draw_fill is not None
+        has_complex_path = False
+        
+        for item in items:
+            kind = item[0]
+            if kind in ("c", "qu"):  # curves, quadratic bezier
+                has_curves = True
+            if kind == "re" and has_fill:
+                has_complex_path = True
+        
+        # If this drawing has fills (not just strokes), mark its region
+        if has_fill or has_curves:
+            rect = drawing.get("rect")
+            if rect and rect.width > 5 and rect.height > 5:
+                complex_regions.append(fitz.Rect(rect))
+    
+    return complex_regions
+
+
+def _merge_overlapping_rects(rects: List[fitz.Rect], margin: float = 5) -> List[fitz.Rect]:
+    """Merge overlapping or nearby rectangles into larger regions."""
+    if not rects:
+        return []
+    
+    merged = []
+    used = [False] * len(rects)
+    
+    for i, rect in enumerate(rects):
+        if used[i]:
+            continue
+        
+        current = fitz.Rect(rect)
+        current.x0 -= margin
+        current.y0 -= margin
+        current.x1 += margin
+        current.y1 += margin
+        
+        changed = True
+        while changed:
+            changed = False
+            for j, other in enumerate(rects):
+                if used[j] or i == j:
+                    continue
+                other_expanded = fitz.Rect(other)
+                other_expanded.x0 -= margin
+                other_expanded.y0 -= margin
+                other_expanded.x1 += margin
+                other_expanded.y1 += margin
+                
+                if current.intersects(other_expanded):
+                    current = current | other_expanded
+                    used[j] = True
+                    changed = True
+        
+        used[i] = True
+        merged.append(current)
+    
+    return merged
+
+
+def _render_region_as_image(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    dpi: int = 300
+) -> Tuple[bytes, int, int]:
+    """
+    Render a specific region of the page as a PNG image.
+    
+    Returns:
+        Tuple of (image_bytes, width_emu, height_emu)
+    """
+    # Calculate the transformation matrix for the clip
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    
+    # Clip and render just this region
+    clip = fitz.Rect(rect)
+    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+    
+    # Convert to PNG bytes
+    img_bytes = pix.tobytes("png")
+    
+    # Return dimensions in EMU
+    w_emu = _pt2emu(rect.width)
+    h_emu = _pt2emu(rect.height)
+    
+    return img_bytes, w_emu, h_emu
 
 
 # ── Floating image builder ───────────────────────────────────────────────────
@@ -279,6 +438,7 @@ def _process_page(
     page: fitz.Page,
     is_first: bool,
     verbose: bool,
+    dpi: int = 300,
 ) -> None:
     """Convert one PDF page into a DOCX section with positioned elements."""
     rect = page.rect
@@ -314,56 +474,111 @@ def _process_page(
     anchor_para.paragraph_format.space_after = Pt(0)
 
     # ── Extract and place images FIRST (behind text) ─────────────────────
+    # Use multiple extraction methods to capture all image types
+    
+    # Method 1: Standard image extraction with full=True
     image_list = page.get_images(full=True)
-    seen_xrefs = set()
+    processed_rects = []  # Track processed image regions to avoid duplicates
+    
     for img_info in image_list:
         xref = img_info[0]
-        if xref in seen_xrefs:
-            continue
-        seen_xrefs.add(xref)
-
+        
         try:
+            # Get ALL rectangles where this image appears (not just the first)
             img_rects = page.get_image_rects(xref)
             if not img_rects:
                 continue
-            img_rect = img_rects[0]
-
+            
             base_image = pdf_doc.extract_image(xref)
             if not base_image or not base_image.get("image"):
                 continue
-
+            
             img_bytes = base_image["image"]
-            ix_emu = _pt2emu(img_rect.x0)
-            iy_emu = _pt2emu(img_rect.y0)
-            iw_emu = _pt2emu(img_rect.width)
-            ih_emu = _pt2emu(img_rect.height)
+            
+            # Process each instance of the image
+            for img_rect in img_rects:
+                # Skip if this rect overlaps significantly with already processed rect
+                rect_tuple = (round(img_rect.x0, 1), round(img_rect.y0, 1), 
+                             round(img_rect.x1, 1), round(img_rect.y1, 1))
+                if rect_tuple in processed_rects:
+                    continue
+                processed_rects.append(rect_tuple)
+                
+                ix_emu = _pt2emu(img_rect.x0)
+                iy_emu = _pt2emu(img_rect.y0)
+                iw_emu = _pt2emu(img_rect.width)
+                ih_emu = _pt2emu(img_rect.height)
 
-            if iw_emu <= 0 or ih_emu <= 0:
-                continue
+                if iw_emu <= 0 or ih_emu <= 0:
+                    continue
 
-            _add_floating_image(
-                word_doc,
-                anchor_para,
-                img_bytes,
-                ix_emu,
-                iy_emu,
-                iw_emu,
-                ih_emu,
-                _next_shape_id(),
-            )
+                _add_floating_image(
+                    word_doc,
+                    anchor_para,
+                    img_bytes,
+                    ix_emu,
+                    iy_emu,
+                    iw_emu,
+                    ih_emu,
+                    _next_shape_id(),
+                )
         except Exception:
             # Skip problematic images rather than failing the whole page
             continue
+    
+    # Method 2: Extract images from XObject Forms (nested images)
+    try:
+        xref_list = page.get_xobjects()
+        for xref_info in xref_list:
+            try:
+                xref = xref_info[0]
+                if xref in [img[0] for img in image_list]:
+                    continue  # Already processed
+                
+                # Try to extract as image
+                base_image = pdf_doc.extract_image(xref)
+                if base_image and base_image.get("image"):
+                    # Try to get position info
+                    img_rects = page.get_image_rects(xref)
+                    for img_rect in (img_rects or []):
+                        rect_tuple = (round(img_rect.x0, 1), round(img_rect.y0, 1), 
+                                     round(img_rect.x1, 1), round(img_rect.y1, 1))
+                        if rect_tuple in processed_rects:
+                            continue
+                        processed_rects.append(rect_tuple)
+                        
+                        img_bytes = base_image["image"]
+                        ix_emu = _pt2emu(img_rect.x0)
+                        iy_emu = _pt2emu(img_rect.y0)
+                        iw_emu = _pt2emu(img_rect.width)
+                        ih_emu = _pt2emu(img_rect.height)
+                        
+                        if iw_emu > 0 and ih_emu > 0:
+                            _add_floating_image(
+                                word_doc,
+                                anchor_para,
+                                img_bytes,
+                                ix_emu,
+                                iy_emu,
+                                iw_emu,
+                                ih_emu,
+                                _next_shape_id(),
+                            )
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     # ── Extract text with exact positions ────────────────────────────────
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+    # Use rawdict for more precise character-level positioning
+    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)["blocks"]
 
     for block in blocks:
         if block["type"] != 0:  # 0 = text block
             continue
 
         for line in block["lines"]:
-            # Group spans that sit on the same line
+            # Process each span individually with proper width calculation
             for span in line["spans"]:
                 text = span["text"]
                 if not text or text.isspace():
@@ -386,22 +601,34 @@ def _process_page(
                 color_hex = _color_to_hex(color)
 
                 # Clean font name (remove subset prefix like "ABCDEF+")
-                if "+" in font:
-                    font = font.split("+", 1)[1]
+                clean_font = font
+                if "+" in clean_font:
+                    clean_font = clean_font.split("+", 1)[1]
 
                 # Position and size in EMU
                 x_emu = _pt2emu(bbox[0])
                 y_emu = _pt2emu(bbox[1])
-                box_w = _pt2emu(bbox[2] - bbox[0])
-                box_h = _pt2emu(bbox[3] - bbox[1])
-
-                # Give a minimum size so text isn't clipped
-                box_w = max(box_w, _pt2emu(len(text) * size * 0.6))
-                box_h = max(box_h, _pt2emu(size * 1.4))
+                
+                # Calculate width from PDF bbox first
+                pdf_width = bbox[2] - bbox[0]
+                pdf_height = bbox[3] - bbox[1]
+                
+                # Use improved character-based width estimation as a minimum
+                estimated_width = _estimate_text_width(text, size, clean_font)
+                
+                # Use the larger of PDF-reported width or estimated width
+                # Add 15% padding to prevent overlap with adjacent text
+                final_width = max(pdf_width, estimated_width) * 1.15
+                
+                # Height should accommodate descenders and ascenders
+                final_height = max(pdf_height, size * 1.5)
+                
+                box_w = _pt2emu(final_width)
+                box_h = _pt2emu(final_height)
 
                 run_xml = _make_run_xml(
                     text,
-                    font_name=font,
+                    font_name=clean_font,
                     font_size_half_pt=size_half_pt,
                     bold=is_bold,
                     italic=is_italic,
@@ -420,13 +647,75 @@ def _process_page(
                 )
 
     # ── Draw rectangles / lines for table borders ────────────────────────
+    # First, identify complex graphics regions that need rasterization
+    complex_regions = _has_complex_graphics(page)
+    
+    # Track regions we've rendered as images
+    rasterized_regions = []
+    
     drawings = page.get_drawings()
+    
+    # Collect all drawings with complex paths (curves, fills) for potential rasterization
+    complex_drawings = []
+    simple_drawings = []
+    
     for drawing in drawings:
+        draw_fill = drawing.get("fill")
+        items = drawing.get("items", [])
+        
+        # Check if drawing has complex elements
+        has_curves = any(item[0] in ("c", "qu", "curve") for item in items)
+        has_fill = draw_fill is not None
+        
+        if has_curves or (has_fill and len(items) > 2):
+            complex_drawings.append(drawing)
+        else:
+            simple_drawings.append(drawing)
+    
+    # Render complex graphics regions as images
+    if complex_regions:
+        merged_regions = _merge_overlapping_rects(complex_regions)
+        for region in merged_regions:
+            # Skip very small regions
+            if region.width < 10 or region.height < 10:
+                continue
+            
+            try:
+                img_bytes, w_emu, h_emu = _render_region_as_image(page, region, dpi=min(dpi, 200))
+                
+                _add_floating_image(
+                    word_doc,
+                    anchor_para,
+                    img_bytes,
+                    _pt2emu(region.x0),
+                    _pt2emu(region.y0),
+                    w_emu,
+                    h_emu,
+                    _next_shape_id(),
+                )
+                rasterized_regions.append(region)
+            except Exception:
+                pass
+    
+    # Process simple drawings as vector shapes
+    for drawing in simple_drawings:
         draw_width = drawing.get("width")
         if draw_width is None:
             draw_width = 0.5
         draw_color = drawing.get("color")
         draw_fill = drawing.get("fill")
+        draw_rect_region = drawing.get("rect")
+        
+        # Skip if this drawing is in a rasterized region
+        if draw_rect_region:
+            drawing_rect = fitz.Rect(draw_rect_region)
+            skip = False
+            for rast_region in rasterized_regions:
+                if rast_region.contains(drawing_rect):
+                    skip = True
+                    break
+            if skip:
+                continue
 
         for item in drawing.get("items", []):
             kind = item[0]
@@ -457,6 +746,44 @@ def _process_page(
                     stroke_width_emu=max(_pt2emu(draw_width), 6350),
                     shape_id=_next_shape_id(),
                 )
+    
+    # For complex drawings that weren't in merged regions, render them individually
+    for drawing in complex_drawings:
+        draw_rect_region = drawing.get("rect")
+        if not draw_rect_region:
+            continue
+        
+        drawing_rect = fitz.Rect(draw_rect_region)
+        
+        # Skip if already rasterized
+        skip = False
+        for rast_region in rasterized_regions:
+            if rast_region.contains(drawing_rect) or rast_region.intersects(drawing_rect):
+                skip = True
+                break
+        if skip:
+            continue
+        
+        # Skip very small regions
+        if drawing_rect.width < 5 or drawing_rect.height < 5:
+            continue
+        
+        try:
+            img_bytes, w_emu, h_emu = _render_region_as_image(page, drawing_rect, dpi=min(dpi, 200))
+            
+            _add_floating_image(
+                word_doc,
+                anchor_para,
+                img_bytes,
+                _pt2emu(drawing_rect.x0),
+                _pt2emu(drawing_rect.y0),
+                w_emu,
+                h_emu,
+                _next_shape_id(),
+            )
+            rasterized_regions.append(drawing_rect)
+        except Exception:
+            pass
 
 
 # ── Shape helpers (rectangles, lines) ────────────────────────────────────────
@@ -649,7 +976,7 @@ def convert_pdf_to_docx(
                 f"  [{i + 1}/{total}] Processing page {idx + 1} …",
                 file=sys.stderr,
             )
-        _process_page(pdf_doc, word_doc, page, is_first=(i == 0), verbose=verbose)
+        _process_page(pdf_doc, word_doc, page, is_first=(i == 0), verbose=verbose, dpi=dpi)
 
     word_doc.save(str(docx_path))
     pdf_doc.close()
