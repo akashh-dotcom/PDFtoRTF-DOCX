@@ -422,6 +422,12 @@ def _process_page(
     # ── Draw rectangles / lines for table borders ────────────────────────
     drawings = page.get_drawings()
     for drawing in drawings:
+        draw_width = drawing.get("width")
+        if draw_width is None:
+            draw_width = 0.5
+        draw_color = drawing.get("color")
+        draw_fill = drawing.get("fill")
+
         for item in drawing.get("items", []):
             kind = item[0]
             if kind == "re":  # rectangle
@@ -432,9 +438,9 @@ def _process_page(
                     _pt2emu(draw_rect.y0),
                     _pt2emu(draw_rect.width),
                     _pt2emu(draw_rect.height),
-                    color_hex=_color_to_hex(drawing.get("color", 0)),
-                    fill_hex=_color_to_hex(drawing.get("fill", None)) if drawing.get("fill") is not None else None,
-                    stroke_width_emu=max(_pt2emu(drawing.get("width", 0.5)), 6350),
+                    color_hex=_color_to_hex(draw_color),
+                    fill_hex=_color_to_hex(draw_fill) if draw_fill is not None else None,
+                    stroke_width_emu=max(_pt2emu(draw_width), 6350),
                     shape_id=_next_shape_id(),
                 )
             elif kind == "l":  # line
@@ -447,8 +453,8 @@ def _process_page(
                     _pt2emu(y0),
                     _pt2emu(x1),
                     _pt2emu(y1),
-                    color_hex=_color_to_hex(drawing.get("color", 0)),
-                    stroke_width_emu=max(_pt2emu(drawing.get("width", 0.5)), 6350),
+                    color_hex=_color_to_hex(draw_color),
+                    stroke_width_emu=max(_pt2emu(draw_width), 6350),
                     shape_id=_next_shape_id(),
                 )
 
